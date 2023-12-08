@@ -1,0 +1,1 @@
+sshfs radiance@192.168.1.250:/Downloads/Dataset_1201_rgb_small /Downloads/Dataset_1201_rgb_small

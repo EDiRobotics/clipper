@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from torch import optim
 from torch.cuda.amp import GradScaler
+from torch.utils.data import DataLoader, DistributedSampler
 
 try:
     import wandb
@@ -29,13 +30,58 @@ except ImportError:
     hvd = None
 
 from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
-from training.data import get_data
+from training.data import get_data, DataInfo, get_imagenet
 from training.distributed import is_master, init_distributed_device, broadcast_object
 from training.logger import setup_logging
 from training.params import parse_args
 from training.scheduler import cosine_lr, const_lr, const_lr_cooldown
 from training.train import train_one_epoch, evaluate
 from training.file_utils import pt_load, check_exists, start_sync_process, remote_sync
+from lmdb_dataset import CLIP_LMDBDataset
+
+
+def get_lmdb_dataset(args, preprocess_fn, is_train, tokenizer=None):
+    path = '/Downloads/Dataset_1201_rgb_small'
+    dataset = CLIP_LMDBDataset(path, preprocess_fn, tokenizer)
+    num_samples = len(dataset)
+    sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
+
+def get_data_edi(args, preprocess_fns, epoch=0, tokenizer=None):
+    preprocess_train, preprocess_val = preprocess_fns
+    data = {}
+
+    if args.train_data or args.dataset_type == "synthetic":
+        data["train"] = get_lmdb_dataset(
+            args, preprocess_train, is_train=True, tokenizer=tokenizer)
+
+    if args.val_data:
+        data["val"] = get_lmdb_dataset(
+            args, preprocess_val, is_train=False, tokenizer=tokenizer)
+
+    if args.imagenet_val is not None:
+        data["imagenet-val"] = get_imagenet(args, preprocess_fns, "val")
+
+    if args.imagenet_v2 is not None:
+        data["imagenet-v2"] = get_imagenet(args, preprocess_fns, "v2")
+
+    return data
+
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
@@ -353,7 +399,7 @@ def main(args):
 
     # initialize datasets
     tokenizer = get_tokenizer(args.model)
-    data = get_data(
+    data = get_data_edi(
         args,
         (preprocess_train, preprocess_val),
         epoch=start_epoch,
